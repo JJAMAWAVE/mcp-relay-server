@@ -18,12 +18,12 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 logger = logging.getLogger("RelayServer")
 
 # ------------------------------------
-# FastAPI App 생성
+# FastAPI App
 # ------------------------------------
 app = FastAPI()
 
 # ------------------------------------
-# CORS (필수)
+# CORS
 # ------------------------------------
 app.add_middleware(
     CORSMiddleware,
@@ -41,36 +41,24 @@ ws_lock = asyncio.Lock()
 message_queue = asyncio.Queue(maxsize=100)
 
 # ------------------------------------
-# MCP Manifest (중요!)
+# 환경 변수
+# ------------------------------------
+RENDER_URL = os.getenv("RENDER_EXTERNAL_URL", "https://mcp-relay-server.onrender.com")
+
+# ------------------------------------
+# MCP Manifest (OpenAI 스펙 준수)
 # ------------------------------------
 @app.get("/.well-known/mcp.json")
 async def mcp_manifest():
     """
-    ChatGPT가 MCP 서버 정보를 읽어가는 엔드포인트
-    ⚠️ url은 실제 Render 배포 URL로 변경 필수!
+    ChatGPT MCP 디스커버리 엔드포인트
     """
-    render_url = os.getenv("RENDER_EXTERNAL_URL", "https://your-app.onrender.com")
-    
     return {
-        "mcpServers": {
-            "relay": {
-                "command": "sse",
-                "url": render_url,
-                "sse": {
-                    "endpoint": "/events"
-                },
-                "transport": {
-                    "type": "sse"
-                },
-                "capabilities": {
-                    "logging": {}
-                }
-            }
-        }
+        "sse_endpoint": f"{RENDER_URL}/sse"
     }
 
 # ------------------------------------
-# 헬스 체크
+# Health Check
 # ------------------------------------
 @app.get("/")
 def health_check():
@@ -78,11 +66,12 @@ def health_check():
         "status": "Running",
         "agent_connected": local_agent_ws is not None,
         "queue_size": message_queue.qsize(),
-        "timestamp": datetime.utcnow().isoformat()
+        "timestamp": datetime.utcnow().isoformat(),
+        "mcp_endpoint": f"{RENDER_URL}/sse"
     }
 
 # =================================================================
-# 1. Local Agent(WebSocket 연결)
+# 1. Local Agent (WebSocket)
 # =================================================================
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
@@ -110,16 +99,14 @@ async def websocket_endpoint(websocket: WebSocket):
                 try:
                     message_queue.get_nowait()
                     message_queue.put_nowait(data)
-                    logger.warning("[Queue] Dropped old message (Buffer Full)")
+                    logger.warning("[Queue] Dropped old message")
                 except:
                     pass
 
     except WebSocketDisconnect:
         logger.warning("[Disconnect] Local Agent Disconnected")
-
     except Exception as e:
         logger.error(f"[WebSocket Error] {e}", exc_info=True)
-
     finally:
         async with ws_lock:
             if local_agent_ws == websocket:
@@ -127,33 +114,57 @@ async def websocket_endpoint(websocket: WebSocket):
 
 
 # =================================================================
-# 2. ChatGPT용 SSE Stream
+# 2. SSE Endpoint (MCP 프로토콜 준수)
 # =================================================================
-@app.get("/events")
+@app.get("/sse")
 async def sse_endpoint(request: Request):
+    """
+    MCP SSE 트랜스포트 엔드포인트
+    스펙: https://spec.modelcontextprotocol.io/specification/basic/transports/#http-with-sse
+    """
     async def event_generator():
         try:
+            # ✅ 필수: 초기 endpoint 이벤트 전송
+            logger.info("[SSE] Client connected, sending endpoint")
+            yield {
+                "event": "endpoint",
+                "data": json.dumps({
+                    "uri": f"{RENDER_URL}/command"
+                })
+            }
+            
+            # 메시지 스트림
             while True:
                 if await request.is_disconnected():
+                    logger.info("[SSE] Client disconnected")
                     break
+                
                 try:
-                    data = await asyncio.wait_for(message_queue.get(), timeout=30.0)
+                    data = await asyncio.wait_for(
+                        message_queue.get(),
+                        timeout=30.0
+                    )
+                    logger.info(f"[SSE] Sending data: {data[:100]}...")
                     yield {"data": data}
+                    
                 except asyncio.TimeoutError:
+                    # Keepalive
                     yield {"comment": "keepalive"}
+                    
         except Exception as e:
-            logger.error(f"[SSE Error] {e}")
+            logger.error(f"[SSE Error] {e}", exc_info=True)
 
     return EventSourceResponse(event_generator())
 
 
 # =================================================================
-# 3. ChatGPT 명령 → LocalAgent 전달 (POST)
+# 3. Command Endpoint (MCP 메시지 수신)
 # =================================================================
 @app.post("/command")
 async def send_command(request: Request):
-    global local_agent_ws
-
+    """
+    ChatGPT → Local Agent 명령 전달
+    """
     async with ws_lock:
         if local_agent_ws is None:
             return JSONResponse(
@@ -166,7 +177,7 @@ async def send_command(request: Request):
             cmd_str = json.dumps(body)
             await local_agent_ws.send_text(cmd_str)
 
-            logger.info(f"[To Local] Command Sent: {cmd_str}")
+            logger.info(f"[To Local] Command: {cmd_str[:100]}...")
 
             return {"status": "Sent", "command": body}
 
@@ -176,11 +187,16 @@ async def send_command(request: Request):
 
 
 # =================================================================
-# 4. Uvicorn 실행 (Render용)
+# 4. Uvicorn 실행
 # =================================================================
 if __name__ == "__main__":
     import uvicorn
-    port = int(os.getenv("PORT", 10000))  # Render 환경 변수 우선
+    port = int(os.getenv("PORT", 10000))
+    
+    logger.info(f"Starting MCP Relay Server on port {port}")
+    logger.info(f"SSE Endpoint: {RENDER_URL}/sse")
+    logger.info(f"Command Endpoint: {RENDER_URL}/command")
+    
     uvicorn.run(
         app,
         host="0.0.0.0",
