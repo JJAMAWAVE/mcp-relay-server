@@ -12,11 +12,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from starlette.websockets import WebSocket, WebSocketDisconnect
 from contextlib import asynccontextmanager
 
-# ------------------------------
-# IMPORT TOOL REGISTRY
-# ------------------------------
-from tools_registry import TOOLS
-
+# ★★★ 툴 레지스트리 임포트 ★★★
+from tools_registry import get_tools_list, TOOL_REGISTRY
 
 # ===========================================================
 # LOGGING
@@ -31,8 +28,8 @@ logger = logging.getLogger("MCPRelayServer")
 # CONFIG
 # ===========================================================
 SERVER_NAME = "mcp-relay-server"
-SERVER_VERSION = "1.0.0"
-PROTOCOL_VERSION = "2025-03-26"
+SERVER_VERSION = "1.1.0" # 버전 업
+PROTOCOL_VERSION = "2024-11-05"
 MCP_SESSION_ID_HEADER = "mcp-session-id"
 
 # ===========================================================
@@ -50,8 +47,7 @@ ws_lock = asyncio.Lock()
 async def lifespan(app: FastAPI):
     logger.info("===== MCP Relay Server Started =====")
     logger.info(f"Protocol: {PROTOCOL_VERSION}")
-    logger.info("Endpoint: /mcp")
-    logger.info("WebSocket: /ws")
+    logger.info(f"Loaded Tools: {list(TOOL_REGISTRY.keys())}")
     yield
     logger.info("===== MCP Relay Server Shutdown =====")
 
@@ -78,12 +74,8 @@ app.add_middleware(
 def add_cors(response: Response):
     response.headers["Access-Control-Allow-Origin"] = "*"
     response.headers["Access-Control-Allow-Methods"] = "GET, POST, DELETE, OPTIONS"
-    response.headers["Access-Control-Allow-Headers"] = (
-        "Content-Type, Accept, Mcp-Session-Id"
-    )
-    response.headers["Access-Control-Expose-Headers"] = (
-        "Mcp-Session-Id, Content-Type"
-    )
+    response.headers["Access-Control-Allow-Headers"] = "Content-Type, Accept, Mcp-Session-Id"
+    response.headers["Access-Control-Expose-Headers"] = "Mcp-Session-Id, Content-Type"
     return response
 
 # ===========================================================
@@ -95,10 +87,8 @@ def health():
         "status": "Running",
         "server": SERVER_NAME,
         "version": SERVER_VERSION,
-        "protocol": PROTOCOL_VERSION,
         "agent_connected": local_agent_ws is not None,
-        "active_sessions": len(active_sessions),
-        "mcp_endpoint": "/mcp",
+        "tool_count": len(TOOL_REGISTRY),
         "time": datetime.utcnow().isoformat()
     }))
 
@@ -107,9 +97,6 @@ def health():
 # ===========================================================
 @app.get("/.well-known/mcp.json")
 def mcp_metadata():
-    # tools must be a dictionary in metadata
-    metadata_tools = {name: data for name, data in TOOLS.items()}
-
     metadata = {
         "protocolVersion": PROTOCOL_VERSION,
         "serverInfo": {
@@ -117,7 +104,7 @@ def mcp_metadata():
             "version": SERVER_VERSION
         },
         "capabilities": {
-            "tools": metadata_tools
+            "tools": TOOL_REGISTRY # 딕셔너리 그대로 제공 (일부 구현체 호환용)
         },
         "transport": "streamableHttp",
         "streamableHttp": {
@@ -150,32 +137,25 @@ async def handle_rpc(body: dict, session_id: str):
 
     # ---- tools/list -------------------------------------------------------
     if method == "tools/list":
-        # Convert registry dict → list format
-        tool_list = [
-            {
-                "name": name,
-                "description": data["description"],
-                "inputSchema": data.get("inputSchema", {})
-            }
-            for name, data in TOOLS.items()
-        ]
-
         return {
             "jsonrpc": "2.0",
             "id": rpc_id,
-            "result": {"tools": tool_list}
+            "result": {
+                "tools": get_tools_list() # ★ 분리된 파일에서 리스트 가져옴
+            }
         }
 
-    # ---- tools/call → relay to Local PC -----------------------------------
+    # ---- tools/call → 로컬 PC로 전달 ---------------------------------------
     if method == "tools/call":
         tool_name = params.get("name")
         arguments = params.get("arguments", {})
 
-        if tool_name not in TOOLS:
-            return {
+        # 등록된 툴인지 확인 (선택 사항이지만 안전을 위해)
+        if tool_name not in TOOL_REGISTRY:
+             return {
                 "jsonrpc": "2.0",
                 "id": rpc_id,
-                "error": {"code": -32601, "message": f"Unknown tool: {tool_name}"}
+                "error": {"code": -32601, "message": f"Tool not found: {tool_name}"}
             }
 
         async with ws_lock:
@@ -190,6 +170,7 @@ async def handle_rpc(body: dict, session_id: str):
             future = loop.create_future()
             pending_requests[rpc_id] = future
 
+            # 로컬 에이전트에게 전송
             await local_agent_ws.send_text(json.dumps({
                 "id": rpc_id,
                 "tool": tool_name,
@@ -197,6 +178,7 @@ async def handle_rpc(body: dict, session_id: str):
             }))
 
         try:
+            # 30초 타임아웃 (Unity 처리 시간 고려)
             result = await asyncio.wait_for(future, timeout=30.0)
             return result
         except asyncio.TimeoutError:
@@ -214,7 +196,7 @@ async def handle_rpc(body: dict, session_id: str):
     }
 
 # ===========================================================
-# MCP ENDPOINT (StreamableHTTP)
+# MCP ENDPOINT (StreamableHttp)
 # ===========================================================
 @app.options("/mcp")
 async def options_mcp():
@@ -261,7 +243,8 @@ async def ws_local(websocket: WebSocket):
 
     async with ws_lock:
         if local_agent_ws:
-            await local_agent_ws.close()
+            try: await local_agent_ws.close()
+            except: pass
         local_agent_ws = websocket
 
     logger.info("Local Agent Connected")
@@ -275,13 +258,14 @@ async def ws_local(websocket: WebSocket):
             if rpc_id in pending_requests:
                 pending_requests[rpc_id].set_result(msg)
                 del pending_requests[rpc_id]
-
     except WebSocketDisconnect:
         logger.warning("Local Agent Disconnected")
     except Exception as e:
         logger.error(f"WebSocket Error: {e}")
     finally:
-        local_agent_ws = None
+        async with ws_lock:
+            if local_agent_ws == websocket:
+                local_agent_ws = None
 
 # ===========================================================
 # RUN
