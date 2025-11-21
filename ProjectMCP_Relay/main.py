@@ -1,204 +1,268 @@
 import asyncio
 import json
 import logging
-import os
+import uuid
 from datetime import datetime
-from typing import Optional
+from typing import Optional, Dict
 
-from fastapi import FastAPI, WebSocket, Request
+from fastapi import FastAPI, Request, Response, HTTPException, WebSocket
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
-from sse_starlette.sse import EventSourceResponse
 from starlette.websockets import WebSocketDisconnect
 
-# ------------------------------------
-# Logging
-# ------------------------------------
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-logger = logging.getLogger("RelayServer")
 
-# ------------------------------------
-# FastAPI App
-# ------------------------------------
-app = FastAPI()
+# ===========================================================
+# CONFIG
+# ===========================================================
 
-# ------------------------------------
-# CORS
-# ------------------------------------
+SERVER_NAME = "mcp-relay-server"
+SERVER_VERSION = "1.0.0"
+PROTOCOL_VERSION = "2025-03-26"
+SESSION_HEADER = "mcp-session-id"
+
+
+# ===========================================================
+# LOGGING
+# ===========================================================
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s"
+)
+logger = logging.getLogger(SERVER_NAME)
+
+
+# ===========================================================
+# APP INIT
+# ===========================================================
+
+app = FastAPI(title=SERVER_NAME, version=SERVER_VERSION)
+
+# CORS: 강력 모드 (Cloud / Render에서도 절대 안 깨짐)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+    allow_credentials=True,
 )
 
-# ------------------------------------
-# 상태 관리
-# ------------------------------------
+
+# ===========================================================
+# INTERNAL STORAGE
+# ===========================================================
+
+active_sessions: Dict[str, dict] = {}
 local_agent_ws: Optional[WebSocket] = None
 ws_lock = asyncio.Lock()
-message_queue = asyncio.Queue(maxsize=100)
+pending_requests: Dict[str, asyncio.Future] = {}
 
-# ------------------------------------
-# 환경 변수
-# ------------------------------------
-RENDER_URL = os.getenv("RENDER_EXTERNAL_URL", "https://mcp-relay-server.onrender.com")
 
-# ------------------------------------
-# MCP Manifest (OpenAI 스펙 준수)
-# ------------------------------------
-@app.get("/.well-known/mcp.json")
-async def mcp_manifest():
-    """
-    ChatGPT MCP 디스커버리 엔드포인트
-    """
-    return {
-        "sse_endpoint": f"{RENDER_URL}/sse"
-    }
+# ===========================================================
+# CORS HEADERS (필수)
+# ===========================================================
 
-# ------------------------------------
-# Health Check
-# ------------------------------------
+def add_cors(res: Response):
+    res.headers["Access-Control-Allow-Origin"] = "*"
+    res.headers["Access-Control-Allow-Methods"] = "GET, POST, DELETE, OPTIONS"
+    res.headers["Access-Control-Allow-Headers"] = "Content-Type, Accept, mcp-session-id"
+    res.headers["Access-Control-Expose-Headers"] = "mcp-session-id"
+    return res
+
+
+# ===========================================================
+# HEALTH CHECK
+# ===========================================================
+
 @app.get("/")
-def health_check():
-    return {
+async def root():
+    return add_cors(JSONResponse({
         "status": "Running",
+        "server": SERVER_NAME,
+        "version": SERVER_VERSION,
+        "protocol": PROTOCOL_VERSION,
         "agent_connected": local_agent_ws is not None,
-        "queue_size": message_queue.qsize(),
-        "timestamp": datetime.utcnow().isoformat(),
-        "mcp_endpoint": f"{RENDER_URL}/sse"
+        "session_count": len(active_sessions)
+    }))
+
+
+# ===========================================================
+# REQUIRED MCP METADATA ENDPOINT
+# ===========================================================
+
+@app.get("/.well-known/mcp.json")
+async def metadata():
+    """
+    ChatGPT가 최초에 읽는 Manifest (가장 중요)
+    """
+    manifest = {
+        "protocolVersion": PROTOCOL_VERSION,
+        "serverInfo": {
+            "name": SERVER_NAME,
+            "version": SERVER_VERSION
+        },
+        "capabilities": {
+            # 필요하면 이곳에 툴만 추가하면 됨 (실제 실행은 로컬)
+            "tools": {
+                "unity_command": {
+                    "name": "unity_command",
+                    "description": "Send commands to Unity (executed on Local PC)"
+                },
+                "python_exec": {
+                    "name": "python_exec",
+                    "description": "Execute python script on Local PC"
+                },
+                "local_ai": {
+                    "name": "local_ai",
+                    "description": "Run local AI inference"
+                }
+            }
+        },
+        "transport": "streamableHttp",
+        "streamableHttp": {
+            "url": "/mcp"
+        }
     }
 
-# =================================================================
-# 1. Local Agent (WebSocket)
-# =================================================================
-@app.websocket("/ws")
-async def websocket_endpoint(websocket: WebSocket):
+    return add_cors(JSONResponse(manifest))
+
+
+# ===========================================================
+# MCP ENDPOINT (JSON-RPC 2.0)
+# ===========================================================
+
+@app.options("/mcp")
+async def options_mcp():
+    return add_cors(Response())
+
+
+@app.post("/mcp")
+async def mcp_post(request: Request):
     global local_agent_ws
 
+    raw = await request.body()
+    body = json.loads(raw.decode("utf-8"))
+    method = body.get("method")
+    rpc_id = body.get("id")
+
+    # 세션 처리
+    session_id = request.headers.get(SESSION_HEADER)
+    if not session_id:
+        session_id = str(uuid.uuid4())
+        active_sessions[session_id] = {
+            "created_at": datetime.utcnow().isoformat()
+        }
+
+    # INITIALIZE 는 서버가 직접 처리
+    if method == "initialize":
+        resp = {
+            "jsonrpc": "2.0",
+            "id": rpc_id,
+            "result": {
+                "protocolVersion": PROTOCOL_VERSION,
+                "serverInfo": {
+                    "name": SERVER_NAME,
+                    "version": SERVER_VERSION
+                },
+                "capabilities": {
+                    "tools": {}
+                }
+            }
+        }
+
+        res = JSONResponse(resp)
+        res.headers[SESSION_HEADER] = session_id
+        return add_cors(res)
+
+    # 로컬 에이전트 미연결
+    if local_agent_ws is None:
+        err = {
+            "jsonrpc": "2.0",
+            "id": rpc_id,
+            "error": {"code": -32000, "message": "Local Agent not connected"}
+        }
+        res = JSONResponse(err)
+        res.headers[SESSION_HEADER] = session_id
+        return add_cors(res)
+
+    # WebSocket으로 로컬 서버에 전달
+    loop = asyncio.get_running_loop()
+    fut = loop.create_future()
+    pending_requests[rpc_id] = fut
+
+    await local_agent_ws.send_text(json.dumps(body))
+
     try:
-        await websocket.accept()
-        async with ws_lock:
-            if local_agent_ws is not None:
-                try:
-                    await local_agent_ws.close()
-                except:
-                    pass
-            local_agent_ws = websocket
+        result = await asyncio.wait_for(fut, timeout=60.0)
+    except asyncio.TimeoutError:
+        result = {
+            "jsonrpc": "2.0",
+            "id": rpc_id,
+            "error": {"code": -32000, "message": "Timeout waiting for Local Agent"}
+        }
 
-        logger.info("[Connect] Local Agent Connected")
+    res = JSONResponse(result)
+    res.headers[SESSION_HEADER] = session_id
+    return add_cors(res)
 
+
+# ===========================================================
+# DELETE SESSION
+# ===========================================================
+
+@app.delete("/mcp")
+async def delete_mcp(request: Request):
+    session_id = request.headers.get(SESSION_HEADER)
+    if session_id in active_sessions:
+        del active_sessions[session_id]
+    return add_cors(Response(status_code=200))
+
+
+# ===========================================================
+# LOCAL PC AGENT WEBSOCKET
+# ===========================================================
+
+@app.websocket("/ws")
+async def ws_local_agent(websocket: WebSocket):
+    global local_agent_ws
+
+    await websocket.accept()
+
+    async with ws_lock:
+        if local_agent_ws:
+            await local_agent_ws.close()
+        local_agent_ws = websocket
+
+    logger.info("Local Agent Connected.")
+
+    try:
         while True:
-            data = await websocket.receive_text()
-            logger.info(f"[From Local] {data[:100]}...")
+            msg = await websocket.receive_text()
+            data = json.loads(msg)
+            resp_id = data.get("id")
 
-            try:
-                message_queue.put_nowait(data)
-            except asyncio.QueueFull:
-                try:
-                    message_queue.get_nowait()
-                    message_queue.put_nowait(data)
-                    logger.warning("[Queue] Dropped old message")
-                except:
-                    pass
-
+            if resp_id in pending_requests:
+                pending_requests[resp_id].set_result(data)
+                del pending_requests[resp_id]
     except WebSocketDisconnect:
-        logger.warning("[Disconnect] Local Agent Disconnected")
+        logger.warning("Local Agent Disconnected.")
     except Exception as e:
-        logger.error(f"[WebSocket Error] {e}", exc_info=True)
+        logger.error(f"WebSocket error: {e}")
     finally:
         async with ws_lock:
             if local_agent_ws == websocket:
                 local_agent_ws = None
 
 
-# =================================================================
-# 2. SSE Endpoint (MCP 프로토콜 준수)
-# =================================================================
-@app.get("/sse")
-async def sse_endpoint(request: Request):
-    """
-    MCP SSE 트랜스포트 엔드포인트
-    스펙: https://spec.modelcontextprotocol.io/specification/basic/transports/#http-with-sse
-    """
-    async def event_generator():
-        try:
-            # ✅ 필수: 초기 endpoint 이벤트 전송
-            logger.info("[SSE] Client connected, sending endpoint")
-            yield {
-                "event": "endpoint",
-                "data": json.dumps({
-                    "uri": f"{RENDER_URL}/command"
-                })
-            }
-            
-            # 메시지 스트림
-            while True:
-                if await request.is_disconnected():
-                    logger.info("[SSE] Client disconnected")
-                    break
-                
-                try:
-                    data = await asyncio.wait_for(
-                        message_queue.get(),
-                        timeout=30.0
-                    )
-                    logger.info(f"[SSE] Sending data: {data[:100]}...")
-                    yield {"data": data}
-                    
-                except asyncio.TimeoutError:
-                    # Keepalive
-                    yield {"comment": "keepalive"}
-                    
-        except Exception as e:
-            logger.error(f"[SSE Error] {e}", exc_info=True)
+# ===========================================================
+# RUN SERVER
+# ===========================================================
 
-    return EventSourceResponse(event_generator())
-
-
-# =================================================================
-# 3. Command Endpoint (MCP 메시지 수신)
-# =================================================================
-@app.post("/command")
-async def send_command(request: Request):
-    """
-    ChatGPT → Local Agent 명령 전달
-    """
-    async with ws_lock:
-        if local_agent_ws is None:
-            return JSONResponse(
-                {"error": "Local Agent is NOT connected."},
-                status_code=503
-            )
-
-        try:
-            body = await request.json()
-            cmd_str = json.dumps(body)
-            await local_agent_ws.send_text(cmd_str)
-
-            logger.info(f"[To Local] Command: {cmd_str[:100]}...")
-
-            return {"status": "Sent", "command": body}
-
-        except Exception as e:
-            logger.error(f"[Command Error] {e}")
-            return JSONResponse({"error": str(e)}, status_code=500)
-
-
-# =================================================================
-# 4. Uvicorn 실행
-# =================================================================
 if __name__ == "__main__":
     import uvicorn
-    port = int(os.getenv("PORT", 10000))
-    
-    logger.info(f"Starting MCP Relay Server on port {port}")
-    logger.info(f"SSE Endpoint: {RENDER_URL}/sse")
-    logger.info(f"Command Endpoint: {RENDER_URL}/command")
-    
     uvicorn.run(
         app,
         host="0.0.0.0",
-        port=port
+        port=int(__import__("os").getenv("PORT", 10000)),
+        log_level="info"
     )
