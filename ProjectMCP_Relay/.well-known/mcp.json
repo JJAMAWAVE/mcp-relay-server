@@ -3,7 +3,10 @@
     "relay": {
       "transport": {
         "type": "sse",
-        "url": "https://mcp-relay-server.onrender.com/sse"
+        "url": "https://mcp-relay-server.onrender.com/events"
+      },
+      "capabilities": {
+        "logging": {}
       },
       "commands": {
         "send": {
