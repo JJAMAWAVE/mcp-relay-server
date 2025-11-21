@@ -1,71 +1,89 @@
-# tools_registry.py
+"""
+tools_registry.py
+자동 Tool 등록 시스템 (플러그인 방식)
 
-TOOLS = {
-    "unity_command": {
-        "name": "unity_command",
-        "description": "Send command to Unity Editor",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "action": {"type": "string"},
-                "parameters": {"type": "object"}
-            },
-            "required": ["action"]
+- tools/ 폴더에 있는 *tools.py 파일을 자동 스캔
+- 내부의 함수 중 @mcp_tool 데코레이터가 붙은 함수만 MCP 툴로 등록
+- main.py와 agent_server.py는 이 파일을 import 해서 사용
+"""
+
+import importlib
+import pkgutil
+import os
+import inspect
+
+# tools 폴더 경로 (로컬 MCP Agent 기준)
+TOOLS_PACKAGE = "tools"
+
+# 등록된 MCP Tools (main.py가 이걸 사용함)
+TOOLS = {}
+
+
+# --------------------------------------------------
+# MCP Tool 데코레이터
+# --------------------------------------------------
+def mcp_tool(name=None, description="", input_schema=None):
+    """
+    @mcp_tool(name="unity_command", description="Unity 명령", input_schema={...})
+    """
+
+    def decorator(func):
+        tool_name = name or func.__name__
+
+        TOOLS[tool_name] = {
+            "callable": func,
+            "description": description,
+            "inputSchema": input_schema or {
+                "type": "object",
+                "properties": {},
+                "required": []
+            }
         }
-    },
 
-    "python_exec": {
-        "name": "python_exec",
-        "description": "Execute Python code on local machine",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "code": {"type": "string"}
-            },
-            "required": ["code"]
-        }
-    },
+        return func
 
-    "ask_local_ai": {
-        "name": "ask_local_ai",
-        "description": "Ask question to Local LLM",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "prompt": {"type": "string"}
-            },
-            "required": ["prompt"]
-        }
-    },
+    return decorator
 
-    # --------------------------------------------------------
-    # NEW: Google Drive Tools for conversation log saving
-    # --------------------------------------------------------
 
-    "google_drive_save_text": {
-        "name": "google_drive_save_text",
-        "description": "Save a text file to Google Drive",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "filename": {"type": "string"},
-                "content": {"type": "string"},
-                "folder_id": {"type": "string"}
-            },
-            "required": ["filename", "content"]
-        }
-    },
+# --------------------------------------------------
+# tools/ 폴더 자동 스캔하여 MCP 툴 로드
+# --------------------------------------------------
+def load_all_tools():
+    global TOOLS
 
-    "google_drive_append_log": {
-        "name": "google_drive_append_log",
-        "description": "Append text content to an existing Google Drive file",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "file_id": {"type": "string"},
-                "append_text": {"type": "string"}
-            },
-            "required": ["file_id", "append_text"]
-        }
-    }
-}
+    package_dir = os.path.join(os.getcwd(), TOOLS_PACKAGE)
+
+    if not os.path.exists(package_dir):
+        print(f"[tools_registry] Tools directory not found: {package_dir}")
+        return
+
+    # 패키지 스캔
+    for module_info in pkgutil.iter_modules([package_dir]):
+        module_name = f"{TOOLS_PACKAGE}.{module_info.name}"
+
+        try:
+            module = importlib.import_module(module_name)
+
+            # 모듈 내 함수 확인
+            for _, obj in inspect.getmembers(module):
+                # @mcp_tool 데코레이터가 붙은 함수만 등록됨
+                if hasattr(obj, "_is_mcp_tool"):
+                    # 데코레이터에서 이미 TOOLS에 등록함
+                    pass
+
+        except Exception as e:
+            print(f"[tools_registry] Failed to load {module_name}: {e}")
+
+
+# --------------------------------------------------
+# 데코레이터에서 마킹할 때 사용
+# --------------------------------------------------
+def mark_as_tool(func):
+    func._is_mcp_tool = True
+    return func
+
+
+# --------------------------------------------------
+# 최종 초기 실행: tools/ 자동 로딩
+# --------------------------------------------------
+load_all_tools()
