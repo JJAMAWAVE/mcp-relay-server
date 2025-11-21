@@ -6,14 +6,15 @@ import uuid
 from datetime import datetime
 from typing import Optional, Dict
 
-from fastapi import FastAPI, Request, Response, HTTPException
+from fastapi import FastAPI, Request, Response
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.websockets import WebSocket, WebSocketDisconnect
 from contextlib import asynccontextmanager
 
-# ★★★ 툴 레지스트리 임포트 ★★★
-from tools_registry import get_tools_list, TOOL_REGISTRY
+# Tool system (자동화)
+from tool_manager import list_tools, get_tool_metadata_dict, tool_exists
+
 
 # ===========================================================
 # LOGGING
@@ -24,13 +25,15 @@ logging.basicConfig(
 )
 logger = logging.getLogger("MCPRelayServer")
 
+
 # ===========================================================
 # CONFIG
 # ===========================================================
 SERVER_NAME = "mcp-relay-server"
-SERVER_VERSION = "1.1.0" # 버전 업
-PROTOCOL_VERSION = "2024-11-05"
+SERVER_VERSION = "1.0.0"
+PROTOCOL_VERSION = "2025-03-26"
 MCP_SESSION_ID_HEADER = "mcp-session-id"
+
 
 # ===========================================================
 # STORAGE
@@ -40,6 +43,7 @@ pending_requests: Dict[str, asyncio.Future] = {}
 local_agent_ws: Optional[WebSocket] = None
 ws_lock = asyncio.Lock()
 
+
 # ===========================================================
 # LIFESPAN
 # ===========================================================
@@ -47,9 +51,11 @@ ws_lock = asyncio.Lock()
 async def lifespan(app: FastAPI):
     logger.info("===== MCP Relay Server Started =====")
     logger.info(f"Protocol: {PROTOCOL_VERSION}")
-    logger.info(f"Loaded Tools: {list(TOOL_REGISTRY.keys())}")
+    logger.info("Endpoint: /mcp")
+    logger.info("WebSocket: /ws")
     yield
     logger.info("===== MCP Relay Server Shutdown =====")
+
 
 # ===========================================================
 # FASTAPI APP
@@ -59,6 +65,7 @@ app = FastAPI(
     version=SERVER_VERSION,
     lifespan=lifespan
 )
+
 
 # ===========================================================
 # CORS
@@ -74,9 +81,14 @@ app.add_middleware(
 def add_cors(response: Response):
     response.headers["Access-Control-Allow-Origin"] = "*"
     response.headers["Access-Control-Allow-Methods"] = "GET, POST, DELETE, OPTIONS"
-    response.headers["Access-Control-Allow-Headers"] = "Content-Type, Accept, Mcp-Session-Id"
-    response.headers["Access-Control-Expose-Headers"] = "Mcp-Session-Id, Content-Type"
+    response.headers["Access-Control-Allow-Headers"] = (
+        "Content-Type, Accept, Mcp-Session-Id"
+    )
+    response.headers["Access-Control-Expose-Headers"] = (
+        "Mcp-Session-Id, Content-Type"
+    )
     return response
+
 
 # ===========================================================
 # HEALTH CHECK
@@ -87,10 +99,13 @@ def health():
         "status": "Running",
         "server": SERVER_NAME,
         "version": SERVER_VERSION,
+        "protocol": PROTOCOL_VERSION,
         "agent_connected": local_agent_ws is not None,
-        "tool_count": len(TOOL_REGISTRY),
+        "active_sessions": len(active_sessions),
+        "mcp_endpoint": "/mcp",
         "time": datetime.utcnow().isoformat()
     }))
+
 
 # ===========================================================
 # MCP METADATA (.well-known)
@@ -104,14 +119,13 @@ def mcp_metadata():
             "version": SERVER_VERSION
         },
         "capabilities": {
-            "tools": TOOL_REGISTRY # 딕셔너리 그대로 제공 (일부 구현체 호환용)
+            "tools": get_tool_metadata_dict()
         },
         "transport": "streamableHttp",
-        "streamableHttp": {
-            "url": "/mcp"
-        }
+        "streamableHttp": {"url": "/mcp"}
     }
     return add_cors(JSONResponse(metadata))
+
 
 # ===========================================================
 # JSON-RPC HANDLER
@@ -123,7 +137,7 @@ async def handle_rpc(body: dict, session_id: str):
 
     logger.info(f"[RPC] {method} (id {rpc_id})")
 
-    # ---- initialize -------------------------------------------------------
+    # initialize
     if method == "initialize":
         return {
             "jsonrpc": "2.0",
@@ -135,27 +149,24 @@ async def handle_rpc(body: dict, session_id: str):
             }
         }
 
-    # ---- tools/list -------------------------------------------------------
+    # tools/list
     if method == "tools/list":
         return {
             "jsonrpc": "2.0",
             "id": rpc_id,
-            "result": {
-                "tools": get_tools_list() # ★ 분리된 파일에서 리스트 가져옴
-            }
+            "result": {"tools": list_tools()}
         }
 
-    # ---- tools/call → 로컬 PC로 전달 ---------------------------------------
+    # tools/call
     if method == "tools/call":
         tool_name = params.get("name")
         arguments = params.get("arguments", {})
 
-        # 등록된 툴인지 확인 (선택 사항이지만 안전을 위해)
-        if tool_name not in TOOL_REGISTRY:
-             return {
+        if not tool_exists(tool_name):
+            return {
                 "jsonrpc": "2.0",
                 "id": rpc_id,
-                "error": {"code": -32601, "message": f"Tool not found: {tool_name}"}
+                "error": {"code": -32601, "message": f"Unknown tool: {tool_name}"}
             }
 
         async with ws_lock:
@@ -170,7 +181,6 @@ async def handle_rpc(body: dict, session_id: str):
             future = loop.create_future()
             pending_requests[rpc_id] = future
 
-            # 로컬 에이전트에게 전송
             await local_agent_ws.send_text(json.dumps({
                 "id": rpc_id,
                 "tool": tool_name,
@@ -178,8 +188,7 @@ async def handle_rpc(body: dict, session_id: str):
             }))
 
         try:
-            # 30초 타임아웃 (Unity 처리 시간 고려)
-            result = await asyncio.wait_for(future, timeout=30.0)
+            result = await asyncio.wait_for(future, timeout=30)
             return result
         except asyncio.TimeoutError:
             del pending_requests[rpc_id]
@@ -195,18 +204,19 @@ async def handle_rpc(body: dict, session_id: str):
         "error": {"code": -32601, "message": f"Unknown method: {method}"}
     }
 
+
 # ===========================================================
-# MCP ENDPOINT (StreamableHttp)
+# MCP HTTP Endpoint
 # ===========================================================
 @app.options("/mcp")
 async def options_mcp():
     return add_cors(Response())
 
+
 @app.post("/mcp")
 async def post_mcp(request: Request):
     try:
         body = await request.json()
-        rpc_id = body.get("id")
 
         session_id = request.headers.get(MCP_SESSION_ID_HEADER)
         if not session_id:
@@ -220,31 +230,29 @@ async def post_mcp(request: Request):
         return add_cors(response)
 
     except Exception as e:
-        logger.error(f"Error: {e}")
-        return add_cors(JSONResponse(
-            {"error": str(e)}, status_code=500
-        ))
+        logger.error(f"Error in MCP: {e}")
+        return add_cors(JSONResponse({"error": str(e)}, status_code=500))
+
 
 @app.delete("/mcp")
 async def delete_mcp(request: Request):
     session_id = request.headers.get(MCP_SESSION_ID_HEADER)
-    if session_id and session_id in active_sessions:
+    if session_id in active_sessions:
         del active_sessions[session_id]
     return add_cors(Response(status_code=200))
 
+
 # ===========================================================
-# LOCAL AGENT (WebSocket)
+# LOCAL AGENT WebSocket
 # ===========================================================
 @app.websocket("/ws")
-async def ws_local(websocket: WebSocket):
+async def websocket_bridge(websocket: WebSocket):
     global local_agent_ws
 
     await websocket.accept()
-
     async with ws_lock:
         if local_agent_ws:
-            try: await local_agent_ws.close()
-            except: pass
+            await local_agent_ws.close()
         local_agent_ws = websocket
 
     logger.info("Local Agent Connected")
@@ -254,18 +262,15 @@ async def ws_local(websocket: WebSocket):
             data = await websocket.receive_text()
             msg = json.loads(data)
             rpc_id = msg.get("id")
-
             if rpc_id in pending_requests:
                 pending_requests[rpc_id].set_result(msg)
                 del pending_requests[rpc_id]
+
     except WebSocketDisconnect:
-        logger.warning("Local Agent Disconnected")
-    except Exception as e:
-        logger.error(f"WebSocket Error: {e}")
+        logger.warning("Local Agent disconnected")
     finally:
-        async with ws_lock:
-            if local_agent_ws == websocket:
-                local_agent_ws = None
+        local_agent_ws = None
+
 
 # ===========================================================
 # RUN
