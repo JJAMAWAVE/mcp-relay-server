@@ -11,7 +11,6 @@ from fastapi.responses import JSONResponse
 from sse_starlette.sse import EventSourceResponse
 from starlette.websockets import WebSocketDisconnect
 
-from ai_pipe_client import UnityPipeClient
 
 # 로컬 AI Manager 준비용 (초기단계)
 # from local_ai_manager import run_local_ai
@@ -164,3 +163,4 @@ async def startup_event():
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
+
