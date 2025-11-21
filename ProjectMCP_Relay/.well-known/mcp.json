@@ -1,20 +1,15 @@
 {
-    "name": "unity_relay",
-    "version": "1.0.0",
-    "description": "Relay server for Unity, Python, and ChatGPT",
-    "tools": [
-        {
-            "name": "unity_command",
-            "description": "Send a command to the local Unity Agent",
-            "path": "/command",
-            "method": "POST"
-        },
-        {
-            "name": "unity_events",
-            "description": "Receive Unity/LocalAgent event stream",
-            "path": "/events",
-            "method": "GET",
-            "stream": true
+  "mcpServers": {
+    "relay": {
+      "transport": {
+        "type": "sse",
+        "url": "https://mcp-relay-server.onrender.com/sse"
+      },
+      "commands": {
+        "send": {
+          "endpoint": "https://mcp-relay-server.onrender.com/command"
         }
-    ]
+      }
+    }
+  }
 }
