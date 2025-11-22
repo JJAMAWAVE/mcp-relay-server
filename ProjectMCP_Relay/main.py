@@ -6,70 +6,54 @@ import uuid
 from datetime import datetime
 from typing import Optional, Dict
 
-from fastapi import FastAPI, Request, Response
+from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
+from starlette.responses import Response
 from starlette.websockets import WebSocket, WebSocketDisconnect
 from contextlib import asynccontextmanager
 
-# Tool system (자동 로딩)
-from tool_manager import list_tools, get_tool_metadata_dict, tool_exists
 
-
-# ===========================================================
-# LOGGING
-# ===========================================================
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(message)s"
 )
 logger = logging.getLogger("MCPRelayServer")
 
-
-# ===========================================================
-# CONFIG
-# ===========================================================
 SERVER_NAME = "mcp-relay-server"
 SERVER_VERSION = "1.0.0"
 PROTOCOL_VERSION = "2025-03-26"
 MCP_SESSION_ID_HEADER = "mcp-session-id"
 
 
-# ===========================================================
-# STORAGE
-# ===========================================================
-active_sessions: Dict[str, dict] = {}
-pending_requests: Dict[str, asyncio.Future] = {}
+# ======================================================
+# GLOBAL STORAGE
+# ======================================================
 local_agent_ws: Optional[WebSocket] = None
 ws_lock = asyncio.Lock()
+active_sessions: Dict[str, dict] = {}
+pending_requests: Dict[str, asyncio.Future] = {}
+
+# 🔥 Local Agent에서 전달받은 실제 Tool 목록 저장
+tools_cache: Dict[str, dict] = {}
 
 
-# ===========================================================
+# ======================================================
 # LIFESPAN
-# ===========================================================
+# ======================================================
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logger.info("===== MCP Relay Server Started =====")
-    logger.info(f"Protocol: {PROTOCOL_VERSION}")
-    logger.info("Endpoint: /mcp")
-    logger.info("WebSocket: /ws")
     yield
     logger.info("===== MCP Relay Server Shutdown =====")
 
 
-# ===========================================================
-# FASTAPI APP
-# ===========================================================
-app = FastAPI(
-    title=SERVER_NAME,
-    version=SERVER_VERSION,
-    lifespan=lifespan
-)
+app = FastAPI(lifespan=lifespan)
 
 
-# ===========================================================
+# ======================================================
 # CORS
-# ===========================================================
+# ======================================================
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -78,21 +62,18 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-def add_cors(response: Response):
-    response.headers["Access-Control-Allow-Origin"] = "*"
-    response.headers["Access-Control-Allow-Methods"] = "GET, POST, DELETE, OPTIONS"
-    response.headers["Access-Control-Allow-Headers"] = (
-        "Content-Type, Accept, Mcp-Session-Id"
-    )
-    response.headers["Access-Control-Expose-Headers"] = (
-        "Mcp-Session-Id, Content-Type"
-    )
-    return response
+
+def add_cors(resp: Response):
+    resp.headers["Access-Control-Allow-Origin"] = "*"
+    resp.headers["Access-Control-Allow-Methods"] = "GET, POST, DELETE, OPTIONS"
+    resp.headers["Access-Control-Allow-Headers"] = "Content-Type, Accept, Mcp-Session-Id"
+    resp.headers["Access-Control-Expose-Headers"] = "Mcp-Session-Id, Content-Type"
+    return resp
 
 
-# ===========================================================
+# ======================================================
 # HEALTH CHECK
-# ===========================================================
+# ======================================================
 @app.get("/")
 def health():
     return add_cors(JSONResponse({
@@ -101,198 +82,157 @@ def health():
         "version": SERVER_VERSION,
         "protocol": PROTOCOL_VERSION,
         "agent_connected": local_agent_ws is not None,
-        "active_sessions": len(active_sessions),
-        "mcp_endpoint": "/mcp",
+        "tool_count": len(tools_cache),
         "time": datetime.utcnow().isoformat()
     }))
 
 
-# ===========================================================
-# MCP METADATA (.well-known)
-# ===========================================================
+# ======================================================
+# WELL-KNOWN MCP METADATA
+# ======================================================
 @app.get("/.well-known/mcp.json")
 def mcp_metadata():
-    metadata = {
+    return add_cors(JSONResponse({
         "protocolVersion": PROTOCOL_VERSION,
-        "serverInfo": {
-            "name": SERVER_NAME,
-            "version": SERVER_VERSION
-        },
-        "capabilities": {
-            "tools": get_tool_metadata_dict()
-        },
+        "serverInfo": {"name": SERVER_NAME, "version": SERVER_VERSION},
+        "capabilities": {"tools": tools_cache},
         "transport": "streamableHttp",
         "streamableHttp": {"url": "/mcp"}
-    }
-    return add_cors(JSONResponse(metadata))
+    }))
 
 
-# ===========================================================
-# JSON-RPC HANDLER
-# ===========================================================
+# ======================================================
+# RPC HANDLER
+# ======================================================
 async def handle_rpc(body: dict, session_id: str):
+    global tools_cache
+
     rpc_id = body.get("id")
     method = body.get("method")
     params = body.get("params", {})
 
-    logger.info(f"[RPC] {method} (id {rpc_id})")
+    logger.info(f"[RPC] {method} (id={rpc_id})")
 
-    # -------------------------------------------------------
-    # initialize (ChatGPT handshake)
-    # -------------------------------------------------------
+    # -------- initialize --------
     if method == "initialize":
-        tool_caps = {
-            name: {"name": name}
-            for name in get_tool_metadata_dict().keys()
-        }
-
         return {
             "jsonrpc": "2.0",
             "id": rpc_id,
             "result": {
                 "protocolVersion": PROTOCOL_VERSION,
                 "serverInfo": {"name": SERVER_NAME, "version": SERVER_VERSION},
-                "capabilities": {
-                    "tools": tool_caps
-                }
+                "capabilities": {"tools": tools_cache}
             }
         }
 
-    # -------------------------------------------------------
-    # tools/list
-    # -------------------------------------------------------
+    # -------- tools/list --------
     if method == "tools/list":
         return {
             "jsonrpc": "2.0",
             "id": rpc_id,
-            "result": {"tools": list_tools()}
+            "result": {"tools": [
+                {"name": tn, **meta} for tn, meta in tools_cache.items()
+            ]}
         }
 
-    # -------------------------------------------------------
-    # tools/call → Local Agent WebSocket
-    # -------------------------------------------------------
+    # -------- tools/call --------
     if method == "tools/call":
         tool_name = params.get("name")
         arguments = params.get("arguments", {})
 
-        if not tool_exists(tool_name):
+        if tool_name not in tools_cache:
             return {
                 "jsonrpc": "2.0",
                 "id": rpc_id,
                 "error": {"code": -32601, "message": f"Unknown tool: {tool_name}"}
             }
 
-        async with ws_lock:
-            if local_agent_ws is None:
-                return {
-                    "jsonrpc": "2.0",
-                    "id": rpc_id,
-                    "error": {"code": -32000, "message": "Local Agent not connected"}
-                }
-
-            loop = asyncio.get_running_loop()
-            future = loop.create_future()
-            pending_requests[rpc_id] = future
-
-            await local_agent_ws.send_text(json.dumps({
+        if local_agent_ws is None:
+            return {
+                "jsonrpc": "2.0",
                 "id": rpc_id,
-                "tool": tool_name,
-                "args": arguments
-            }))
+                "error": {"code": -32000, "message": "Local Agent not connected"}
+            }
+
+        loop = asyncio.get_running_loop()
+        future = loop.create_future()
+        pending_requests[rpc_id] = future
+
+        await local_agent_ws.send_text(json.dumps({
+            "id": rpc_id,
+            "tool": tool_name,
+            "args": arguments
+        }))
 
         try:
-            result = await asyncio.wait_for(future, timeout=30)
+            result = await asyncio.wait_for(future, timeout=45)
             return result
         except asyncio.TimeoutError:
-            if rpc_id in pending_requests:
-                del pending_requests[rpc_id]
             return {
                 "jsonrpc": "2.0",
                 "id": rpc_id,
                 "error": {"code": -32000, "message": "Local Agent timeout"}
             }
 
-    # -------------------------------------------------------
-    # Unknown method
-    # -------------------------------------------------------
-    return {
-        "jsonrpc": "2.0",
-        "id": rpc_id,
-        "error": {"code": -32601, "message": f"Unknown method: {method}"}
-    }
+
+# ======================================================
+# MCP HTTP ENDPOINT
+# ======================================================
+@app.post("/mcp")
+async def post_mcp(request: Request):
+    body = await request.json()
+    session_id = request.headers.get(MCP_SESSION_ID_HEADER) or str(uuid.uuid4())
+    active_sessions[session_id] = {}
+
+    result = await handle_rpc(body, session_id)
+
+    resp = JSONResponse(result)
+    resp.headers[MCP_SESSION_ID_HEADER] = session_id
+    return add_cors(resp)
 
 
-# ===========================================================
-# MCP HTTP Endpoint
-# ===========================================================
 @app.options("/mcp")
 async def options_mcp():
     return add_cors(Response())
 
 
-@app.post("/mcp")
-async def post_mcp(request: Request):
-    try:
-        body = await request.json()
-
-        session_id = request.headers.get(MCP_SESSION_ID_HEADER)
-        if not session_id:
-            session_id = str(uuid.uuid4())
-            active_sessions[session_id] = {}
-
-        result = await handle_rpc(body, session_id)
-
-        response = JSONResponse(result)
-        response.headers[MCP_SESSION_ID_HEADER] = session_id
-        return add_cors(response)
-
-    except Exception as e:
-        logger.error(f"Error in MCP: {e}")
-        return add_cors(JSONResponse({"error": str(e)}, status_code=500))
-
-
-@app.delete("/mcp")
-async def delete_mcp(request: Request):
-    session_id = request.headers.get(MCP_SESSION_ID_HEADER)
-    if session_id in active_sessions:
-        del active_sessions[session_id]
-    return add_cors(Response(status_code=200))
-
-
-# ===========================================================
+# ======================================================
 # LOCAL AGENT WebSocket
-# ===========================================================
+# ======================================================
 @app.websocket("/ws")
-async def websocket_bridge(websocket: WebSocket):
-    global local_agent_ws
+async def websocket_bridge(ws: WebSocket):
+    global local_agent_ws, tools_cache
 
-    await websocket.accept()
+    await ws.accept()
     async with ws_lock:
         if local_agent_ws:
             await local_agent_ws.close()
-        local_agent_ws = websocket
+        local_agent_ws = ws
 
     logger.info("Local Agent Connected")
 
+    # 🔥 Local Agent에게 툴 목록 요청
+    await ws.send_text(json.dumps({
+        "id": "__sync_tools__",
+        "type": "sync_request"
+    }))
+
     try:
         while True:
-            data = await websocket.receive_text()
-            msg = json.loads(data)
-            rpc_id = msg.get("id")
-            if rpc_id in pending_requests:
-                pending_requests[rpc_id].set_result(msg)
-                del pending_requests[rpc_id]
+            msg = json.loads(await ws.receive_text())
+            msg_id = msg.get("id")
+
+            # 🔥 툴 목록 동기화 응답 처리
+            if msg_id == "__sync_tools__":
+                tools_cache = msg.get("tools", {})
+                logger.info(f"[SYNC] Tools Updated: {len(tools_cache)} Tools Loaded")
+                continue
+
+            # 일반 툴 응답 처리
+            if msg_id in pending_requests:
+                pending_requests[msg_id].set_result(msg)
+                del pending_requests[msg_id]
 
     except WebSocketDisconnect:
-        logger.warning("Local Agent disconnected")
-    finally:
+        logger.warning("Local Agent Disconnected")
         local_agent_ws = None
-
-
-# ===========================================================
-# RUN
-# ===========================================================
-if __name__ == "__main__":
-    import uvicorn
-    port = int(os.getenv("PORT", 10000))
-    uvicorn.run(app, host="0.0.0.0", port=port)
