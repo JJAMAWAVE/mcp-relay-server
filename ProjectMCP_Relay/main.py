@@ -12,7 +12,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from starlette.websockets import WebSocket, WebSocketDisconnect
 from contextlib import asynccontextmanager
 
-# Tool system (자동화)
+# Tool system (자동 로딩)
 from tool_manager import list_tools, get_tool_metadata_dict, tool_exists
 
 
@@ -137,19 +137,30 @@ async def handle_rpc(body: dict, session_id: str):
 
     logger.info(f"[RPC] {method} (id {rpc_id})")
 
-    # initialize
+    # -------------------------------------------------------
+    # initialize (ChatGPT handshake)
+    # -------------------------------------------------------
     if method == "initialize":
+        tool_caps = {
+            name: {"name": name}
+            for name in get_tool_metadata_dict().keys()
+        }
+
         return {
             "jsonrpc": "2.0",
             "id": rpc_id,
             "result": {
                 "protocolVersion": PROTOCOL_VERSION,
                 "serverInfo": {"name": SERVER_NAME, "version": SERVER_VERSION},
-                "capabilities": {"tools": {}}
+                "capabilities": {
+                    "tools": tool_caps
+                }
             }
         }
 
+    # -------------------------------------------------------
     # tools/list
+    # -------------------------------------------------------
     if method == "tools/list":
         return {
             "jsonrpc": "2.0",
@@ -157,7 +168,9 @@ async def handle_rpc(body: dict, session_id: str):
             "result": {"tools": list_tools()}
         }
 
-    # tools/call
+    # -------------------------------------------------------
+    # tools/call → Local Agent WebSocket
+    # -------------------------------------------------------
     if method == "tools/call":
         tool_name = params.get("name")
         arguments = params.get("arguments", {})
@@ -191,13 +204,17 @@ async def handle_rpc(body: dict, session_id: str):
             result = await asyncio.wait_for(future, timeout=30)
             return result
         except asyncio.TimeoutError:
-            del pending_requests[rpc_id]
+            if rpc_id in pending_requests:
+                del pending_requests[rpc_id]
             return {
                 "jsonrpc": "2.0",
                 "id": rpc_id,
                 "error": {"code": -32000, "message": "Local Agent timeout"}
             }
 
+    # -------------------------------------------------------
+    # Unknown method
+    # -------------------------------------------------------
     return {
         "jsonrpc": "2.0",
         "id": rpc_id,
